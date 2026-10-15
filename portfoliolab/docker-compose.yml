@@ -1,0 +1,98 @@
+name: portfoliolab
+
+# Every variable has a default, so `docker compose up` works without a .env
+# file. The defaults are for local demo use only: set your own values (at least
+# AUTH_SECRET and POSTGRES_PASSWORD) before exposing the app on a network.
+
+x-database-url: &database-url postgresql://${POSTGRES_USER:-portfoliolab}:${POSTGRES_PASSWORD:-portfoliolab}@db:5432/${POSTGRES_DB:-portfoliolab}
+
+# Shared definition for the one-off jobs (same image, different commands).
+x-tools: &tools
+  build:
+    context: .
+    target: tools
+  image: portfoliolab-tools
+  environment:
+    DATABASE_URL: *database-url
+    SIMULATED_PRICES: ${SIMULATED_PRICES:-true}
+  restart: "no"
+
+services:
+  db:
+    image: postgres:17-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-portfoliolab}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-portfoliolab}
+      POSTGRES_DB: ${POSTGRES_DB:-portfoliolab}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      # -h 127.0.0.1: during first-time initialisation Postgres runs a
+      # temporary server on the Unix socket only; checking over TCP avoids
+      # reporting "healthy" before the real server is up.
+      test: ["CMD-SHELL", "pg_isready -h 127.0.0.1 -U $${POSTGRES_USER} -d $${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    restart: unless-stopped
+
+  # 1. Apply Prisma migrations
+  migrate:
+    <<: *tools
+    command: ["npx", "prisma", "migrate", "deploy"]
+    depends_on:
+      db:
+        condition: service_healthy
+
+  # 2. Load companies from data/companies.csv, then simulated prices for
+  #    companies that have none (skipped when SIMULATED_PRICES=false).
+  #    Both steps are idempotent.
+  seed:
+    <<: *tools
+    command: ["sh", "-c", "npx tsx data/parser.ts && npx tsx data/simulate_prices.ts"]
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+
+  # Optional: import real daily prices from Twelve Data (needs TWELVE_KEY).
+  # Only runs when asked for:  docker compose --profile import up prices
+  prices:
+    <<: *tools
+    profiles: ["import"]
+    command: ["npx", "tsx", "data/api.ts"]
+    environment:
+      DATABASE_URL: *database-url
+      TWELVE_KEY: ${TWELVE_KEY:-}
+    depends_on:
+      seed:
+        condition: service_completed_successfully
+
+  app:
+    build:
+      context: .
+      target: runner
+    image: portfoliolab-app
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    environment:
+      DATABASE_URL: *database-url
+      # Local demo default. Replace with `openssl rand -base64 32` output.
+      AUTH_SECRET: ${AUTH_SECRET:-portfoliolab-local-demo-secret-do-not-use-in-production}
+      AUTH_TRUST_HOST: "true"
+      AUTH_URL: ${AUTH_URL:-http://localhost:3000}
+      # "Try the demo" login with a shared account (no Google setup needed)
+      DEMO_MODE: ${DEMO_MODE:-true}
+      # Optional Google sign-in; the button appears only when both are set
+      AUTH_GOOGLE_ID: ${AUTH_GOOGLE_ID:-}
+      AUTH_GOOGLE_SECRET: ${AUTH_GOOGLE_SECRET:-}
+      # Shows the "prices are simulated" notice
+      SIMULATED_PRICES: ${SIMULATED_PRICES:-true}
+    depends_on:
+      db:
+        condition: service_healthy
+      seed:
+        condition: service_completed_successfully
+    restart: unless-stopped
+
+volumes:
+  pgdata:
